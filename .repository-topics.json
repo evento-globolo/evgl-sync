@@ -1,0 +1,12 @@
+[
+  "aggregation",
+  "axum",
+  "discovery",
+  "events",
+  "evgl",
+  "geospatial",
+  "json-merge",
+  "opto-sync",
+  "rust",
+  "sync"
+]
