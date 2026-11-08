@@ -186,7 +186,49 @@ PY
 expect_denied "recipient missing wrapped key" "missing or malformed age-wrapped data"
 rm "$fixture/env/enc/dev.env.enc"
 
+
+# Additional SOPS metadata-smuggling negative cases, backported after reviewing
+# the stronger Dioxus parser. No private keys or plaintext secrets are used.
+mutate_metadata_case() {
+  local scenario="$1" expected="$2"
+  cp "$root/env/enc/dev.env.enc" "$fixture/env/enc/dev.env.enc"
+  python3 - "$fixture/env/enc/dev.env.enc" "$scenario" <<'PY'
+from pathlib import Path
+import sys
+
+path, scenario = Path(sys.argv[1]), sys.argv[2]
+lines = path.read_text().splitlines(keepends=True)
+
+def set_key(name, value):
+    matches = [i for i, line in enumerate(lines) if line.startswith(name + "=")]
+    assert len(matches) == 1, name
+    lines[matches[0]] = name + "=" + value + "\n"
+
+if scenario == "commented_plaintext":
+    lines.append("# CLOUD_SECRET=fixture-data-only\n")
+elif scenario == "unknown_sops_metadata":
+    lines.append("sops_hidden_plaintext=fixture-data-only\n")
+elif scenario == "malformed_timestamp":
+    set_key("sops_lastmodified", "yesterday")
+elif scenario == "timezone_missing":
+    set_key("sops_lastmodified", "2026-11-07T12:00:00")
+elif scenario == "unexpected_suffix":
+    set_key("sops_unencrypted_suffix", "PASSWORD")
+else:
+    raise AssertionError("unknown metadata mutation")
+path.write_text("".join(lines))
+PY
+  expect_denied "$scenario" "$expected"
+  rm "$fixture/env/enc/dev.env.enc"
+}
+
+mutate_metadata_case commented_plaintext "plaintext dotenv assignment in ciphertext comment"
+mutate_metadata_case unknown_sops_metadata "unexpected SOPS metadata key sops_hidden_plaintext"
+mutate_metadata_case malformed_timestamp "missing or invalid SOPS modification timestamp"
+mutate_metadata_case timezone_missing "missing or invalid SOPS modification timestamp"
+mutate_metadata_case unexpected_suffix "unexpected SOPS unencrypted suffix"
+
 run_check >"$log" 2>&1 || { cat "$log" >&2; exit 1; }
 test ! -e "$fixture/env/dec" && test ! -L "$fixture/env/dec" \
   || { echo "FAIL: final audit created env/dec" >&2; exit 1; }
-echo "PASS: clean keyless control plus nineteen adversarial denial cases (symlinks, plaintext, private key, ignore rules, ciphertext shape)"
+echo "PASS: clean keyless control plus twenty-four adversarial denial cases (symlinks, plaintext, private key, ignore rules, ciphertext shape)"
