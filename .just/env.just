@@ -287,23 +287,540 @@ env-check:
     # Key-independent checks first, so this whole recipe is runnable in CI with
     # no age key at all. Handing CI a decryption key just to lint would defeat
     # the point of the audit.
-    echo "ciphertext integrity:"
+    echo "ciphertext structure (keyless; authenticity not verified):"
     shopt -s nullglob
     found=0
     for f in env/enc/*.env.enc; do
       found=1
-      if ! grep -q 'ENC\[AES256_GCM' "$f"; then
-        note "$f is NOT sops-encrypted — it is plaintext in env/enc/"
+      # Do not follow a ciphertext-file symlink, even if the directory is safe.
+      if [[ -L $f || ! -f $f ]]; then
+        note "$f is a symlink or not a regular file"
         continue
       fi
-      grep -q '^sops_mac=' "$f" || note "$f has no sops MAC (truncated or hand-edited?)"
-      # Every file must keep at least two recipients. With one, losing that key
-      # makes the file permanently unreadable — sops has no backdoor.
-      r=$(grep -c 'map_recipient' "$f" || true)
-      if [[ $r -lt 2 ]]; then
-        note "$f has $r recipient(s); needs >= 2 so a lost key is survivable"
+      # A keyless runner can check format, but CANNOT authenticate the MAC.
+      # Require an encrypted variable (not merely a comment or the SOPS MAC).
+      if ! { grep -E '^[A-Za-z_][A-Za-z0-9_]*=ENC\[AES256_GCM,data:[^,]+,iv:[^,]+,tag:[^,]+,type:[A-Za-z0-9_]+\]
+    [[ $found -eq 1 ]] || echo "  · no environments yet"
+
+    # Only now, and only if a key is actually present, prove it decrypts.
+    keyfile=""
+    for p in "${SOPS_AGE_KEY_FILE:-}" \
+             "${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt" \
+             "$HOME/Library/Application Support/sops/age/keys.txt"; do
+      [[ -n $p && -f $p ]] && { keyfile=$p; break; }
+    done
+    if [[ -z $keyfile && -z ${SOPS_AGE_KEY:-} ]]; then
+      echo "  · no age key on this host — skipped decryption (fine in CI)"
+    else
+      for f in env/enc/*.env.enc; do
+        sops decrypt --input-type dotenv --output-type dotenv "$f" >/dev/null 2>&1 \
+          && echo "  ✓ $f decrypts with your key" \
+          || note "$f does NOT decrypt with your key (ask for a rekey)"
+      done
+    fi
+
+    [[ $fail -eq 0 ]] && echo $'\nenv-check PASSED' || { echo $'\nenv-check FAILED'; exit 1; }
+
+# Wipe decrypted plaintext from env/dec (regenerate with `just env-decrypt`).
+[group('env')]
+env-clean: _env-dec
+    #!/usr/bin/env bash
+    set -euo pipefail
+    shopt -s nullglob
+    n=0
+    for f in {{ _dec }}/*.env; do
+      # Overwrite before unlinking so the plaintext does not linger in free blocks.
+      # NOT `dd ... status=none`: that flag is GNU-only, macOS dd rejects it, and
+      # with 2>/dev/null||true the overwrite silently never happened. `head -c`
+      # from /dev/zero behaves identically on both.
+      head -c "$(wc -c <"$f")" /dev/zero > "$f" 2>/dev/null || true
+      rm -f -- "$f"
+      n=$((n+1))
+    done
+    echo "removed $n decrypted file(s) from env/dec/"
+
+# ─── containers ─────────────────────────────────────────────────────────────
+#
+# Decryption happens at RUN time, never at build time. A secret decrypted during
+# `docker build` is written into an image layer and stays there — a later
+# `RUN rm` does not remove it, and `--build-arg` is worse still because it lands
+# in `docker history`.
+#
+# Unlike the sonus-auris/ores-sops container pattern, nothing is baked into the
+# image here: no sops binary, no ciphertext, no entrypoint script. That is not a
+# style preference — `sops exec-env` shells out to /bin/sh in BOTH modes
+# (`--same-process` included; measured, it fails on a valid single-word binary
+# path), and most fiducia services run on gcr.io/distroless/cc-debian12, which
+# has no shell. Decrypting host-side and injecting with --env-file is the only
+# form that works on distroless, and it leaves the application as PID 1 so
+# SIGTERM reaches it directly and it can drain on `docker stop`.
+#
+# Trade-off, stated plainly: --env-file values are visible in `docker inspect`.
+# The in-image alternative instead exposes SOPS_AGE_KEY there — a key that
+# decrypts every environment — so this is the smaller leak, not a free win.
+# For real deployments use `env-k8s-secret` (below) or a platform secret store.
+
+# Run a container with <name>'s variables injected. Image needs no sops/shell.
+# Everything after <name> goes to `docker run` verbatim, so flags work:
+#   just env-docker-run local -p 8080:8080 --name api ghcr.io/…/fiducia-auth:dev
+[group('docker')]
+env-docker-run name +args: _env-dec
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src={{ _enc }}/{{ name }}.env.enc
+    [[ -f $src ]] || { echo "no such environment: {{ name }}" >&2; exit 1; }
+    command -v docker >/dev/null || { echo "docker not found" >&2; exit 1; }
+    shift 1   # drop <name>; "$@" is everything docker run should receive
+    # Materialise and validate BEFORE invoking docker. Inlining this as a
+    # process substitution fails open: if the pipeline errors, docker still
+    # receives a truncated env-file and cheerfully starts the container without
+    # its secrets. `set -e` on the assignment turns that into a hard stop.
+    envdata=$(sops decrypt {{ _fmt }} "$src" | {{ _dotenv }} envfile)
+    # The plaintext is a pipe the docker CLI reads; it never reaches the disk.
+    # No --rm here: the caller controls docker's flags, so `-d`, `--rm`, `-p`
+    # and friends are theirs to pass.
+    exec docker run --env-file <(printf '%s\n' "$envdata") "$@"
+
+# Materialise a 0600 env-file for `docker compose` (env_file:) — plaintext on disk.
+[group('docker')]
+env-docker-env-file name: _env-dec
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src={{ _enc }}/{{ name }}.env.enc
+    [[ -f $src ]] || { echo "no such environment: {{ name }}" >&2; exit 1; }
+    out={{ _dec }}/{{ name }}.env
+    tmp=$(mktemp "{{ _dec }}/.{{ name }}.XXXXXX"); chmod 600 "$tmp"
+    sops decrypt {{ _fmt }} "$src" | {{ _dotenv }} envfile > "$tmp"; mv -f "$tmp" "$out"
+    # compose needs a real path for `env_file:`; prefer env-docker-run when the
+    # plaintext file is avoidable. Wipe it afterwards with `just env-clean`.
+    echo "$out"
+
+# Render a Kubernetes Secret from <name>. Pipe to `kubectl apply -f -` to apply.
+[group('docker')]
+env-k8s-secret name secret="": _env-dec
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src={{ _enc }}/{{ name }}.env.enc
+    [[ -f $src ]] || { echo "no such environment: {{ name }}" >&2; exit 1; }
+    sname="{{ secret }}"
+    if [[ -z $sname ]]; then
+      # NOT basename(justfile_directory()): inside a container the repo is mounted
+      # at an arbitrary path (/w, /workspace, /github/workspace) and the secret
+      # would silently be named after the mount point. The git remote is stable
+      # wherever the repo is checked out.
+      repo=$(git config --get remote.origin.url 2>/dev/null | sed 's#.*[/:]##; s#\.git$##')
+      [[ -n $repo ]] || repo=$(basename "$PWD")
+      sname="$(printf '%s-%s' "$repo" "{{ name }}" | tr '._' '--' | tr -cd 'a-zA-Z0-9-')"
+    fi
+    # --dry-run=client: this only renders YAML, it never contacts a cluster.
+    # The app container then uses `envFrom: [secretRef: {name: <sname>}]` and
+    # stays distroless — it never needs sops or the age key.
+    # Rendered directly rather than via `kubectl --from-env-file`, which is the
+    # same dotenv format and so cannot carry a multi-line value either.
+    sops decrypt {{ _fmt }} "$src" | {{ _dotenv }} k8s "$sname"
+
+# Report whether this environment can run the env recipes, and which ones.
+# The pattern has to work on a laptop, inside a devcontainer, and on a CI runner
+# with no key — those have different tools available, so state it rather than
+# failing later with something cryptic.
+[group('env')]
+env-doctor: _env-dec
+    #!/usr/bin/env bash
+    set -uo pipefail
+    ok=0; miss=0
+    row() { # name required-for
+      if command -v "$1" >/dev/null 2>&1; then
+        printf '  ✓ %-10s %s\n' "$1" "$(command -v "$1")"; ok=$((ok+1))
       else
-        echo "  ✓ $f encrypted, $r recipients"
+        printf '  ✗ %-10s MISSING — needed for: %s\n' "$1" "$2"; miss=$((miss+1))
+      fi
+    }
+    echo "tools:"
+    row bash       "every recipe"
+    row git        "env-check"
+    row sops       "encrypt/decrypt/edit/rekey"
+    row python3    "env-run, env-docker-run, env-k8s-secret (.just/dotenv.py)"
+    row age-keygen "env-keygen, env-whoami only"
+    row docker     "env-docker-run only"
+    row kubectl    "only to APPLY a Secret; env-k8s-secret renders YAML without it"
+
+    echo "key material:"
+    key=""
+    for p in "${SOPS_AGE_KEY_FILE:-}" \
+             "${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt" \
+             "$HOME/Library/Application Support/sops/age/keys.txt"; do
+      [[ -n $p && -f $p ]] && { key=$p; break; }
+    done
+    if [[ -n ${SOPS_AGE_KEY:-} ]]; then echo "  ✓ SOPS_AGE_KEY set in the environment"
+    elif [[ -n $key ]]; then echo "  ✓ key file $key"
+    else echo "  · no age key — read-only checks still work (this is normal in CI)"; fi
+
+    echo "context:"
+    # /.dockerenv is created by docker; cgroup matching also catches podman/k8s.
+    if [[ -f /.dockerenv ]] || grep -qaE 'docker|containerd|kubepods' /proc/1/cgroup 2>/dev/null; then
+      echo "  running INSIDE a container"
+    else
+      echo "  running on a host (not containerised)"
+    fi
+    echo "  uname=$(uname -s) arch=$(uname -m)"
+    [[ -n ${IN_NIX_SHELL:-} ]] && echo "  nix devshell: $IN_NIX_SHELL" || echo "  nix devshell: no"
+
+    echo
+    if [[ $miss -eq 0 ]]; then echo "env-doctor: all tools present"; else
+      echo "env-doctor: $ok present, $miss missing — recipes needing the missing tools will fail"; fi
+ "$f" | grep -qv '^sops_'; }; then
+        note "$f is NOT sops-encrypted — no encrypted dotenv value"
+        continue
+      fi
+      grep -Eq '^sops_mac=ENC\[AES256_GCM,data:[^,]+,iv:[^,]+,tag:[^,]+,type:[A-Za-z0-9_]+\]
+    [[ $found -eq 1 ]] || echo "  · no environments yet"
+
+    # Only now, and only if a key is actually present, prove it decrypts.
+    keyfile=""
+    for p in "${SOPS_AGE_KEY_FILE:-}" \
+             "${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt" \
+             "$HOME/Library/Application Support/sops/age/keys.txt"; do
+      [[ -n $p && -f $p ]] && { keyfile=$p; break; }
+    done
+    if [[ -z $keyfile && -z ${SOPS_AGE_KEY:-} ]]; then
+      echo "  · no age key on this host — skipped decryption (fine in CI)"
+    else
+      for f in env/enc/*.env.enc; do
+        sops decrypt --input-type dotenv --output-type dotenv "$f" >/dev/null 2>&1 \
+          && echo "  ✓ $f decrypts with your key" \
+          || note "$f does NOT decrypt with your key (ask for a rekey)"
+      done
+    fi
+
+    [[ $fail -eq 0 ]] && echo $'\nenv-check PASSED' || { echo $'\nenv-check FAILED'; exit 1; }
+
+# Wipe decrypted plaintext from env/dec (regenerate with `just env-decrypt`).
+[group('env')]
+env-clean: _env-dec
+    #!/usr/bin/env bash
+    set -euo pipefail
+    shopt -s nullglob
+    n=0
+    for f in {{ _dec }}/*.env; do
+      # Overwrite before unlinking so the plaintext does not linger in free blocks.
+      # NOT `dd ... status=none`: that flag is GNU-only, macOS dd rejects it, and
+      # with 2>/dev/null||true the overwrite silently never happened. `head -c`
+      # from /dev/zero behaves identically on both.
+      head -c "$(wc -c <"$f")" /dev/zero > "$f" 2>/dev/null || true
+      rm -f -- "$f"
+      n=$((n+1))
+    done
+    echo "removed $n decrypted file(s) from env/dec/"
+
+# ─── containers ─────────────────────────────────────────────────────────────
+#
+# Decryption happens at RUN time, never at build time. A secret decrypted during
+# `docker build` is written into an image layer and stays there — a later
+# `RUN rm` does not remove it, and `--build-arg` is worse still because it lands
+# in `docker history`.
+#
+# Unlike the sonus-auris/ores-sops container pattern, nothing is baked into the
+# image here: no sops binary, no ciphertext, no entrypoint script. That is not a
+# style preference — `sops exec-env` shells out to /bin/sh in BOTH modes
+# (`--same-process` included; measured, it fails on a valid single-word binary
+# path), and most fiducia services run on gcr.io/distroless/cc-debian12, which
+# has no shell. Decrypting host-side and injecting with --env-file is the only
+# form that works on distroless, and it leaves the application as PID 1 so
+# SIGTERM reaches it directly and it can drain on `docker stop`.
+#
+# Trade-off, stated plainly: --env-file values are visible in `docker inspect`.
+# The in-image alternative instead exposes SOPS_AGE_KEY there — a key that
+# decrypts every environment — so this is the smaller leak, not a free win.
+# For real deployments use `env-k8s-secret` (below) or a platform secret store.
+
+# Run a container with <name>'s variables injected. Image needs no sops/shell.
+# Everything after <name> goes to `docker run` verbatim, so flags work:
+#   just env-docker-run local -p 8080:8080 --name api ghcr.io/…/fiducia-auth:dev
+[group('docker')]
+env-docker-run name +args: _env-dec
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src={{ _enc }}/{{ name }}.env.enc
+    [[ -f $src ]] || { echo "no such environment: {{ name }}" >&2; exit 1; }
+    command -v docker >/dev/null || { echo "docker not found" >&2; exit 1; }
+    shift 1   # drop <name>; "$@" is everything docker run should receive
+    # Materialise and validate BEFORE invoking docker. Inlining this as a
+    # process substitution fails open: if the pipeline errors, docker still
+    # receives a truncated env-file and cheerfully starts the container without
+    # its secrets. `set -e` on the assignment turns that into a hard stop.
+    envdata=$(sops decrypt {{ _fmt }} "$src" | {{ _dotenv }} envfile)
+    # The plaintext is a pipe the docker CLI reads; it never reaches the disk.
+    # No --rm here: the caller controls docker's flags, so `-d`, `--rm`, `-p`
+    # and friends are theirs to pass.
+    exec docker run --env-file <(printf '%s\n' "$envdata") "$@"
+
+# Materialise a 0600 env-file for `docker compose` (env_file:) — plaintext on disk.
+[group('docker')]
+env-docker-env-file name: _env-dec
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src={{ _enc }}/{{ name }}.env.enc
+    [[ -f $src ]] || { echo "no such environment: {{ name }}" >&2; exit 1; }
+    out={{ _dec }}/{{ name }}.env
+    tmp=$(mktemp "{{ _dec }}/.{{ name }}.XXXXXX"); chmod 600 "$tmp"
+    sops decrypt {{ _fmt }} "$src" | {{ _dotenv }} envfile > "$tmp"; mv -f "$tmp" "$out"
+    # compose needs a real path for `env_file:`; prefer env-docker-run when the
+    # plaintext file is avoidable. Wipe it afterwards with `just env-clean`.
+    echo "$out"
+
+# Render a Kubernetes Secret from <name>. Pipe to `kubectl apply -f -` to apply.
+[group('docker')]
+env-k8s-secret name secret="": _env-dec
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src={{ _enc }}/{{ name }}.env.enc
+    [[ -f $src ]] || { echo "no such environment: {{ name }}" >&2; exit 1; }
+    sname="{{ secret }}"
+    if [[ -z $sname ]]; then
+      # NOT basename(justfile_directory()): inside a container the repo is mounted
+      # at an arbitrary path (/w, /workspace, /github/workspace) and the secret
+      # would silently be named after the mount point. The git remote is stable
+      # wherever the repo is checked out.
+      repo=$(git config --get remote.origin.url 2>/dev/null | sed 's#.*[/:]##; s#\.git$##')
+      [[ -n $repo ]] || repo=$(basename "$PWD")
+      sname="$(printf '%s-%s' "$repo" "{{ name }}" | tr '._' '--' | tr -cd 'a-zA-Z0-9-')"
+    fi
+    # --dry-run=client: this only renders YAML, it never contacts a cluster.
+    # The app container then uses `envFrom: [secretRef: {name: <sname>}]` and
+    # stays distroless — it never needs sops or the age key.
+    # Rendered directly rather than via `kubectl --from-env-file`, which is the
+    # same dotenv format and so cannot carry a multi-line value either.
+    sops decrypt {{ _fmt }} "$src" | {{ _dotenv }} k8s "$sname"
+
+# Report whether this environment can run the env recipes, and which ones.
+# The pattern has to work on a laptop, inside a devcontainer, and on a CI runner
+# with no key — those have different tools available, so state it rather than
+# failing later with something cryptic.
+[group('env')]
+env-doctor: _env-dec
+    #!/usr/bin/env bash
+    set -uo pipefail
+    ok=0; miss=0
+    row() { # name required-for
+      if command -v "$1" >/dev/null 2>&1; then
+        printf '  ✓ %-10s %s\n' "$1" "$(command -v "$1")"; ok=$((ok+1))
+      else
+        printf '  ✗ %-10s MISSING — needed for: %s\n' "$1" "$2"; miss=$((miss+1))
+      fi
+    }
+    echo "tools:"
+    row bash       "every recipe"
+    row git        "env-check"
+    row sops       "encrypt/decrypt/edit/rekey"
+    row python3    "env-run, env-docker-run, env-k8s-secret (.just/dotenv.py)"
+    row age-keygen "env-keygen, env-whoami only"
+    row docker     "env-docker-run only"
+    row kubectl    "only to APPLY a Secret; env-k8s-secret renders YAML without it"
+
+    echo "key material:"
+    key=""
+    for p in "${SOPS_AGE_KEY_FILE:-}" \
+             "${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt" \
+             "$HOME/Library/Application Support/sops/age/keys.txt"; do
+      [[ -n $p && -f $p ]] && { key=$p; break; }
+    done
+    if [[ -n ${SOPS_AGE_KEY:-} ]]; then echo "  ✓ SOPS_AGE_KEY set in the environment"
+    elif [[ -n $key ]]; then echo "  ✓ key file $key"
+    else echo "  · no age key — read-only checks still work (this is normal in CI)"; fi
+
+    echo "context:"
+    # /.dockerenv is created by docker; cgroup matching also catches podman/k8s.
+    if [[ -f /.dockerenv ]] || grep -qaE 'docker|containerd|kubepods' /proc/1/cgroup 2>/dev/null; then
+      echo "  running INSIDE a container"
+    else
+      echo "  running on a host (not containerised)"
+    fi
+    echo "  uname=$(uname -s) arch=$(uname -m)"
+    [[ -n ${IN_NIX_SHELL:-} ]] && echo "  nix devshell: $IN_NIX_SHELL" || echo "  nix devshell: no"
+
+    echo
+    if [[ $miss -eq 0 ]]; then echo "env-doctor: all tools present"; else
+      echo "env-doctor: $ok present, $miss missing — recipes needing the missing tools will fail"; fi
+ "$f" \
+        || note "$f has no sops MAC (or malformed encrypted MAC)"
+      # Count DISTINCT age recipients; arbitrary text mentioning map_recipient
+      # or repeated copies of one recipient cannot satisfy the recovery policy.
+      r=$(grep -E '^sops_age__list_[0-9]+__map_recipient=age1[0-9a-z]+
+    [[ $found -eq 1 ]] || echo "  · no environments yet"
+
+    # Only now, and only if a key is actually present, prove it decrypts.
+    keyfile=""
+    for p in "${SOPS_AGE_KEY_FILE:-}" \
+             "${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt" \
+             "$HOME/Library/Application Support/sops/age/keys.txt"; do
+      [[ -n $p && -f $p ]] && { keyfile=$p; break; }
+    done
+    if [[ -z $keyfile && -z ${SOPS_AGE_KEY:-} ]]; then
+      echo "  · no age key on this host — skipped decryption (fine in CI)"
+    else
+      for f in env/enc/*.env.enc; do
+        sops decrypt --input-type dotenv --output-type dotenv "$f" >/dev/null 2>&1 \
+          && echo "  ✓ $f decrypts with your key" \
+          || note "$f does NOT decrypt with your key (ask for a rekey)"
+      done
+    fi
+
+    [[ $fail -eq 0 ]] && echo $'\nenv-check PASSED' || { echo $'\nenv-check FAILED'; exit 1; }
+
+# Wipe decrypted plaintext from env/dec (regenerate with `just env-decrypt`).
+[group('env')]
+env-clean: _env-dec
+    #!/usr/bin/env bash
+    set -euo pipefail
+    shopt -s nullglob
+    n=0
+    for f in {{ _dec }}/*.env; do
+      # Overwrite before unlinking so the plaintext does not linger in free blocks.
+      # NOT `dd ... status=none`: that flag is GNU-only, macOS dd rejects it, and
+      # with 2>/dev/null||true the overwrite silently never happened. `head -c`
+      # from /dev/zero behaves identically on both.
+      head -c "$(wc -c <"$f")" /dev/zero > "$f" 2>/dev/null || true
+      rm -f -- "$f"
+      n=$((n+1))
+    done
+    echo "removed $n decrypted file(s) from env/dec/"
+
+# ─── containers ─────────────────────────────────────────────────────────────
+#
+# Decryption happens at RUN time, never at build time. A secret decrypted during
+# `docker build` is written into an image layer and stays there — a later
+# `RUN rm` does not remove it, and `--build-arg` is worse still because it lands
+# in `docker history`.
+#
+# Unlike the sonus-auris/ores-sops container pattern, nothing is baked into the
+# image here: no sops binary, no ciphertext, no entrypoint script. That is not a
+# style preference — `sops exec-env` shells out to /bin/sh in BOTH modes
+# (`--same-process` included; measured, it fails on a valid single-word binary
+# path), and most fiducia services run on gcr.io/distroless/cc-debian12, which
+# has no shell. Decrypting host-side and injecting with --env-file is the only
+# form that works on distroless, and it leaves the application as PID 1 so
+# SIGTERM reaches it directly and it can drain on `docker stop`.
+#
+# Trade-off, stated plainly: --env-file values are visible in `docker inspect`.
+# The in-image alternative instead exposes SOPS_AGE_KEY there — a key that
+# decrypts every environment — so this is the smaller leak, not a free win.
+# For real deployments use `env-k8s-secret` (below) or a platform secret store.
+
+# Run a container with <name>'s variables injected. Image needs no sops/shell.
+# Everything after <name> goes to `docker run` verbatim, so flags work:
+#   just env-docker-run local -p 8080:8080 --name api ghcr.io/…/fiducia-auth:dev
+[group('docker')]
+env-docker-run name +args: _env-dec
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src={{ _enc }}/{{ name }}.env.enc
+    [[ -f $src ]] || { echo "no such environment: {{ name }}" >&2; exit 1; }
+    command -v docker >/dev/null || { echo "docker not found" >&2; exit 1; }
+    shift 1   # drop <name>; "$@" is everything docker run should receive
+    # Materialise and validate BEFORE invoking docker. Inlining this as a
+    # process substitution fails open: if the pipeline errors, docker still
+    # receives a truncated env-file and cheerfully starts the container without
+    # its secrets. `set -e` on the assignment turns that into a hard stop.
+    envdata=$(sops decrypt {{ _fmt }} "$src" | {{ _dotenv }} envfile)
+    # The plaintext is a pipe the docker CLI reads; it never reaches the disk.
+    # No --rm here: the caller controls docker's flags, so `-d`, `--rm`, `-p`
+    # and friends are theirs to pass.
+    exec docker run --env-file <(printf '%s\n' "$envdata") "$@"
+
+# Materialise a 0600 env-file for `docker compose` (env_file:) — plaintext on disk.
+[group('docker')]
+env-docker-env-file name: _env-dec
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src={{ _enc }}/{{ name }}.env.enc
+    [[ -f $src ]] || { echo "no such environment: {{ name }}" >&2; exit 1; }
+    out={{ _dec }}/{{ name }}.env
+    tmp=$(mktemp "{{ _dec }}/.{{ name }}.XXXXXX"); chmod 600 "$tmp"
+    sops decrypt {{ _fmt }} "$src" | {{ _dotenv }} envfile > "$tmp"; mv -f "$tmp" "$out"
+    # compose needs a real path for `env_file:`; prefer env-docker-run when the
+    # plaintext file is avoidable. Wipe it afterwards with `just env-clean`.
+    echo "$out"
+
+# Render a Kubernetes Secret from <name>. Pipe to `kubectl apply -f -` to apply.
+[group('docker')]
+env-k8s-secret name secret="": _env-dec
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src={{ _enc }}/{{ name }}.env.enc
+    [[ -f $src ]] || { echo "no such environment: {{ name }}" >&2; exit 1; }
+    sname="{{ secret }}"
+    if [[ -z $sname ]]; then
+      # NOT basename(justfile_directory()): inside a container the repo is mounted
+      # at an arbitrary path (/w, /workspace, /github/workspace) and the secret
+      # would silently be named after the mount point. The git remote is stable
+      # wherever the repo is checked out.
+      repo=$(git config --get remote.origin.url 2>/dev/null | sed 's#.*[/:]##; s#\.git$##')
+      [[ -n $repo ]] || repo=$(basename "$PWD")
+      sname="$(printf '%s-%s' "$repo" "{{ name }}" | tr '._' '--' | tr -cd 'a-zA-Z0-9-')"
+    fi
+    # --dry-run=client: this only renders YAML, it never contacts a cluster.
+    # The app container then uses `envFrom: [secretRef: {name: <sname>}]` and
+    # stays distroless — it never needs sops or the age key.
+    # Rendered directly rather than via `kubectl --from-env-file`, which is the
+    # same dotenv format and so cannot carry a multi-line value either.
+    sops decrypt {{ _fmt }} "$src" | {{ _dotenv }} k8s "$sname"
+
+# Report whether this environment can run the env recipes, and which ones.
+# The pattern has to work on a laptop, inside a devcontainer, and on a CI runner
+# with no key — those have different tools available, so state it rather than
+# failing later with something cryptic.
+[group('env')]
+env-doctor: _env-dec
+    #!/usr/bin/env bash
+    set -uo pipefail
+    ok=0; miss=0
+    row() { # name required-for
+      if command -v "$1" >/dev/null 2>&1; then
+        printf '  ✓ %-10s %s\n' "$1" "$(command -v "$1")"; ok=$((ok+1))
+      else
+        printf '  ✗ %-10s MISSING — needed for: %s\n' "$1" "$2"; miss=$((miss+1))
+      fi
+    }
+    echo "tools:"
+    row bash       "every recipe"
+    row git        "env-check"
+    row sops       "encrypt/decrypt/edit/rekey"
+    row python3    "env-run, env-docker-run, env-k8s-secret (.just/dotenv.py)"
+    row age-keygen "env-keygen, env-whoami only"
+    row docker     "env-docker-run only"
+    row kubectl    "only to APPLY a Secret; env-k8s-secret renders YAML without it"
+
+    echo "key material:"
+    key=""
+    for p in "${SOPS_AGE_KEY_FILE:-}" \
+             "${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt" \
+             "$HOME/Library/Application Support/sops/age/keys.txt"; do
+      [[ -n $p && -f $p ]] && { key=$p; break; }
+    done
+    if [[ -n ${SOPS_AGE_KEY:-} ]]; then echo "  ✓ SOPS_AGE_KEY set in the environment"
+    elif [[ -n $key ]]; then echo "  ✓ key file $key"
+    else echo "  · no age key — read-only checks still work (this is normal in CI)"; fi
+
+    echo "context:"
+    # /.dockerenv is created by docker; cgroup matching also catches podman/k8s.
+    if [[ -f /.dockerenv ]] || grep -qaE 'docker|containerd|kubepods' /proc/1/cgroup 2>/dev/null; then
+      echo "  running INSIDE a container"
+    else
+      echo "  running on a host (not containerised)"
+    fi
+    echo "  uname=$(uname -s) arch=$(uname -m)"
+    [[ -n ${IN_NIX_SHELL:-} ]] && echo "  nix devshell: $IN_NIX_SHELL" || echo "  nix devshell: no"
+
+    echo
+    if [[ $miss -eq 0 ]]; then echo "env-doctor: all tools present"; else
+      echo "env-doctor: $ok present, $miss missing — recipes needing the missing tools will fail"; fi
+ "$f" \
+          | cut -d= -f2 | sort -u | wc -l | tr -d '[:space:]' || true)
+      r=${r:-0}
+      if [[ $r -lt 2 ]]; then
+        note "$f has $r distinct age recipient(s); needs >= 2 so a lost key is survivable"
+      else
+        echo "  ✓ $f has SOPS-shaped ciphertext and $r distinct age recipients (authenticity not verified)"
       fi
     done
     [[ $found -eq 1 ]] || echo "  · no environments yet"
