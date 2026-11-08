@@ -222,12 +222,31 @@ env-keygen: _env-dec
 
 # Fail-closed audit: no plaintext in git, gitignore intact, ciphertext valid.
 [group('env')]
-env-check: _env-dec
+env-check:
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{ justfile_directory() }}
     fail=0
     note() { echo "  ✗ $1"; fail=1; }
+
+    # Fail closed if Git metadata/index are missing, not as an empty source tree.
+    if [[ $(git rev-parse --is-inside-work-tree 2>/dev/null) != true ]] \
+        || ! git ls-files -z >/dev/null 2>&1; then
+      echo "  ✗ env-check requires a readable Git checkout and index" >&2
+      exit 1
+    fi
+
+    # Read-only audit: deny symlinks/non-directories without any decryption tool.
+    for rel in env env/enc env/dec; do
+      if [[ -L $rel ]]; then
+        echo "  ✗ $rel must not be a symlink" >&2
+        exit 1
+      fi
+      if [[ -e $rel && ! -d $rel ]]; then
+        echo "  ✗ $rel must be a directory" >&2
+        exit 1
+      fi
+    done
 
     echo "tracked files:"
     # Dotenv-shaped secrets: `.env`, `.env.<anything>`, and anything under
@@ -275,23 +294,35 @@ env-check: _env-dec
     # Key-independent checks first, so this whole recipe is runnable in CI with
     # no age key at all. Handing CI a decryption key just to lint would defeat
     # the point of the audit.
-    echo "ciphertext integrity:"
+    echo "ciphertext structure (keyless; authenticity not verified):"
     shopt -s nullglob
     found=0
     for f in env/enc/*.env.enc; do
       found=1
-      if ! grep -q 'ENC\[AES256_GCM' "$f"; then
-        note "$f is NOT sops-encrypted — it is plaintext in env/enc/"
+      # Never follow a symlink for individual ciphertext files.
+      if [[ -L $f || ! -f $f ]]; then
+        note "$f is a symlink or not a regular file"
         continue
       fi
-      grep -q '^sops_mac=' "$f" || note "$f has no sops MAC (truncated or hand-edited?)"
-      # Every file must keep at least two recipients. With one, losing that key
-      # makes the file permanently unreadable — sops has no backdoor.
-      r=$(grep -c 'map_recipient' "$f" || true)
+      # Keyless checks can establish SOPS-like STRUCTURE, not authenticity.
+      if ! { grep -E '^[A-Za-z_][A-Za-z0-9_]*=ENC\[AES256_GCM,data:[^,]+,iv:[^,]+,tag:[^,]+,type:[A-Za-z0-9_]+\]$' "$f" | grep -qv '^sops_'; }; then
+        note "$f is NOT sops-encrypted — no encrypted dotenv value"
+        continue
+      fi
+      grep -Eq '^sops_mac=ENC\[AES256_GCM,data:[^,]+,iv:[^,]+,tag:[^,]+,type:[A-Za-z0-9_]+\]$' "$f" \
+        || note "$f has no sops MAC (or malformed encrypted MAC)"
+      # Count DISTINCT age recipients, not free text or repeated copies.
+      r=$(grep -E '^sops_age__list_[0-9]+__map_recipient=age1[0-9a-z]+$' "$f" \
+          | cut -d= -f2 | sort -u | wc -l | tr -d '[:space:]' || true)
       if [[ $r -lt 2 ]]; then
-        note "$f has $r recipient(s); needs >= 2 so a lost key is survivable"
+        note "$f has $r distinct age recipient(s); needs >= 2 so a lost key is survivable"
       else
-        echo "  ✓ $f encrypted, $r recipients"
+        echo "  ✓ $f has SOPS-shaped ciphertext and $r distinct age recipients (authenticity not verified)"
+      fi
+      # Reject forged Base64, wrong IV/tag lengths, plaintext adjacent to
+      # ciphertext, duplicate dotenv keys and broken age-wrapped key slots.
+      if ! python3 .just/check-sops-envelope.py "$f"; then
+        note "$f structurally invalid SOPS ciphertext"
       fi
     done
     [[ $found -eq 1 ]] || echo "  · no environments yet"
