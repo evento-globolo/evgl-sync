@@ -9,9 +9,10 @@ trap 'rm -rf -- "$fixture"' EXIT
 mkdir -p "$fixture/.just" "$fixture/env/enc" "$fixture/keyless-config" "$fixture/keyless-home"
 cp "$root/justfile" "$fixture/justfile"
 cp "$root/.just/env.just" "$fixture/.just/env.just"
+cp "$root/.just/check-sops-envelope.py" "$fixture/.just/check-sops-envelope.py"
 cp "$root/.gitignore" "$fixture/.gitignore"
 git -C "$fixture" init -q
-git -C "$fixture" add justfile .just/env.just .gitignore
+git -C "$fixture" add justfile .just/env.just .just/check-sops-envelope.py .gitignore
 git -C "$fixture" -c user.name=env-audit-test -c user.email=env-audit-test@example.invalid commit -qm "isolated fixture"
 
 run_check() (
@@ -126,7 +127,59 @@ printf '%s\n' \
 expect_denied "duplicate recovery recipients" "needs >= 2"
 rm "$fixture/env/enc/dev.env.enc"
 
+
+# Fail closed when Git metadata disappears; the old ls-files pipeline masked it.
+mv "$fixture/.git" "$fixture/.git-hidden"
+expect_denied "missing Git checkout index" "requires a readable Git checkout and index"
+mv "$fixture/.git-hidden" "$fixture/.git"
+
+# Actual encrypted fixture: the parser must admit the canonical SOPS envelope
+# without decrypting or providing keys.
+cp "$root/env/enc/dev.env.enc" "$fixture/env/enc/dev.env.enc"
+run_check >"$log" 2>&1 || { cat "$log" >&2; exit 1; }
+echo "PASS: structurally valid ciphertext without decryption"
+rm "$fixture/env/enc/dev.env.enc"
+
+# An encrypted marker must not conceal an adjacent unencrypted dotenv value.
+cp "$root/env/enc/dev.env.enc" "$fixture/env/enc/dev.env.enc"
+printf '%s\n' 'PUBLIC_TEST_VALUE=plaintext-fixture-only' >>"$fixture/env/enc/dev.env.enc"
+expect_denied "plaintext adjacent to encrypted value" "invalid SOPS AES-GCM envelope for PUBLIC_TEST_VALUE"
+rm "$fixture/env/enc/dev.env.enc"
+
+# Duplicate metadata keys are ambiguous to readers and must be rejected.
+cp "$root/env/enc/dev.env.enc" "$fixture/env/enc/dev.env.enc"
+printf '%s\n' 'sops_version=3.11.0' >>"$fixture/env/enc/dev.env.enc"
+expect_denied "duplicate SOPS version" "duplicate dotenv key sops_version"
+rm "$fixture/env/enc/dev.env.enc"
+
+# Corrupt one AES-GCM authentication tag in a ciphertext-only fixture.
+cp "$root/env/enc/dev.env.enc" "$fixture/env/enc/dev.env.enc"
+python3 - "$fixture/env/enc/dev.env.enc" <<'PY'
+from pathlib import Path
+import re
+import sys
+path = Path(sys.argv[1])
+body, changed = re.subn(r'tag:[A-Za-z0-9+/=]+', 'tag:INVALID!', path.read_text(), count=1)
+assert changed == 1
+path.write_text(body)
+PY
+expect_denied "malformed AES-GCM tag" "invalid SOPS AES-GCM envelope"
+rm "$fixture/env/enc/dev.env.enc"
+
+# Every age recipient must have a wrapped key, not a bare public label.
+cp "$root/env/enc/dev.env.enc" "$fixture/env/enc/dev.env.enc"
+python3 - "$fixture/env/enc/dev.env.enc" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+lines = path.read_text().splitlines(keepends=True)
+lines = [line for line in lines if not line.startswith('sops_age__list_1__map_enc=')]
+path.write_text(''.join(lines))
+PY
+expect_denied "recipient missing wrapped key" "missing or malformed age-wrapped data"
+rm "$fixture/env/enc/dev.env.enc"
+
 run_check >"$log" 2>&1 || { cat "$log" >&2; exit 1; }
 test ! -e "$fixture/env/dec" && test ! -L "$fixture/env/dec" \
   || { echo "FAIL: final audit created env/dec" >&2; exit 1; }
-echo "PASS: clean keyless control plus fourteen adversarial denial cases (symlinks, plaintext, private key, ignore rules, ciphertext shape)"
+echo "PASS: clean keyless control plus nineteen adversarial denial cases (symlinks, plaintext, private key, ignore rules, ciphertext shape)"
