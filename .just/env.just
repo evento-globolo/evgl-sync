@@ -229,6 +229,13 @@ env-check:
     fail=0
     note() { echo "  ✗ $1"; fail=1; }
 
+    # Fail closed if Git metadata/index are missing, not as an empty source tree.
+    if [[ $(git rev-parse --is-inside-work-tree 2>/dev/null) != true ]] \
+        || ! git ls-files -z >/dev/null 2>&1; then
+      echo "  ✗ env-check requires a readable Git checkout and index" >&2
+      exit 1
+    fi
+
     # Read-only audit: deny symlinks/non-directories without any decryption tool.
     for rel in env env/enc env/dec; do
       if [[ -L $rel ]]; then
@@ -311,6 +318,11 @@ env-check:
         note "$f has $r distinct age recipient(s); needs >= 2 so a lost key is survivable"
       else
         echo "  ✓ $f has SOPS-shaped ciphertext and $r distinct age recipients (authenticity not verified)"
+      fi
+      # Reject forged Base64, wrong IV/tag lengths, plaintext adjacent to
+      # ciphertext, duplicate dotenv keys and broken age-wrapped key slots.
+      if ! python3 .just/check-sops-envelope.py "$f"; then
+        note "$f structurally invalid SOPS ciphertext"
       fi
     done
     [[ $found -eq 1 ]] || echo "  · no environments yet"
