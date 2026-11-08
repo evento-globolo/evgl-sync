@@ -159,9 +159,16 @@ from pathlib import Path
 import re
 import sys
 path = Path(sys.argv[1])
-body, changed = re.subn(r'tag:[A-Za-z0-9+/=]+', 'tag:INVALID!', path.read_text(), count=1)
-assert changed == 1
-path.write_text(body)
+lines = path.read_text().splitlines(keepends=True)
+changed = False
+for i, line in enumerate(lines):
+    # SOPS can include an encrypted header comment; corrupt a real value.
+    if '=ENC[AES256_GCM' in line and not line.startswith(('#', 'sops_')):
+        lines[i], n = re.subn(r'tag:[A-Za-z0-9+/=]+', 'tag:INVALID!', line, count=1)
+        changed = n == 1
+        break
+assert changed, "fixture must contain an encrypted dotenv value"
+path.write_text(''.join(lines))
 PY
 expect_denied "malformed AES-GCM tag" "invalid SOPS AES-GCM envelope"
 rm "$fixture/env/enc/dev.env.enc"
